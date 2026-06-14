@@ -360,3 +360,144 @@ error TSwapPool__WethDepositAmountTooLow();
 **IMPACT:** None — cosmetic / minor gas on revert paths only.
 **LIKELIHOOD:** N/A — design choice, not an exploitable condition.
 **Severity:** Informational
+### [I-6] Three arguments in `TSwapPool::swap` event should be indexed
+
+**Description:**
+
+The `Swap` event declares five parameters but only `swapper` is marked `indexed`. The token addresses and amounts are emitted as non-indexed data:
+
+```solidity
+event Swap(
+    address indexed swapper,
+    IERC20 tokenIn,
+    uint256 amountTokenIn,
+    IERC20 tokenOut,
+    uint256 amountTokenOut
+);
+```
+
+In the EVM log model, each `indexed` argument becomes a **topic** and can be used in efficient `eth_getLogs` filters. Non-indexed arguments are stored only in the log **data** payload and cannot be filtered on-chain without scanning every log from the contract.
+
+Because `Swap` has more than three parameters total, the most filter-relevant fields should use the three available indexed slots (Solidity’s per-event maximum): the caller (`swapper`), the input token (`tokenIn`), and the output token (`tokenOut`). The two `uint256` amounts should remain non-indexed — they are execution-specific values that integrators read from log data, not typical filter keys.
+
+**Impact:**
+
+No direct security impact or loss of funds. The impact is **off-chain observability and integrator UX**:
+
+**Proof of Concept:**
+
+Inspect `TSwapPool.sol` — `Swap` indexes only `swapper`; `tokenIn` and `tokenOut` are plain `IERC20` parameters without `indexed`.
+**Recommended Mitigation:**
+
+Index `tokenIn` and `tokenOut` alongside `swapper`, keeping amounts in the data section:
+
+```diff
+event Swap(
+    address indexed swapper,
+-   IERC20 tokenIn,
++   IERC20 indexed tokenIn,
+    uint256 amountTokenIn,
+-   IERC20 tokenOut,
++   IERC20 indexed tokenOut,
+    uint256 amountTokenOut
+);
+```
+
+This uses all three allowed indexed parameters. No change is required at the `emit Swap(...)` call site — argument order and types stay the same.
+
+**Note:** Changing event signatures is a **breaking change** for existing indexers and subgraphs. If the protocol is already deployed, coordinate a versioned ABI update; for pre-deployment code, apply the fix before release.
+
+## Likelihood & Impact:
+**IMPACT:** None — affects log filtering and off-chain tooling only; on-chain swap logic is unchanged.
+**LIKELIHOOD:** N/A — informational finding; not an exploitable condition.
+**Severity:** Informational
+
+### [I-7] Redundant `balanceOf` calls in `TSwapPool::deposit` waste gas
+
+**Description:**
+
+In the non-initial `deposit` branch (`totalLiquidityTokenSupply() > 0`), the contract reads pool reserves multiple times via external `balanceOf` calls when two reads would suffice.
+
+```solidity
+if (totalLiquidityTokenSupply() > 0) {
+    uint256 wethReserves = i_wethToken.balanceOf(address(this));
+    uint256 poolTokenReserves = i_poolToken.balanceOf(address(this)); // never used in code
+
+    uint256 poolTokensToDeposit = getPoolTokensToDepositBasedOnWeth(wethToDeposit);
+    // ...
+    liquidityTokensToMint =
+        (wethToDeposit * totalLiquidityTokenSupply()) / wethReserves;
+}
+```
+
+Two separate issues compound the waste:
+
+1. **Dead read on line 135:** `poolTokenReserves` is assigned but never used in executable code — it appears only in NatSpec-style math comments. Every subsequent deposit pays for an extra ERC-20 `CALL` that has no effect on the outcome.
+
+2. **Duplicate reads inside `getPoolTokensToDepositBasedOnWeth`:** That helper performs both `balanceOf` calls again:
+
+```solidity
+function getPoolTokensToDepositBasedOnWeth(uint256 wethToDeposit) public view returns (uint256) {
+    uint256 poolTokenReserves = i_poolToken.balanceOf(address(this));
+    uint256 wethReserves = i_wethToken.balanceOf(address(this));
+    return (wethToDeposit * poolTokenReserves) / wethReserves;
+}
+```
+
+So each `deposit` after pool initialization performs **four** `balanceOf` external calls when **two** are enough: `wethReserves` is fetched twice (lines 133 and inside the helper), and `poolTokenReserves` is fetched twice (line 135 unused + inside the helper).
+
+`getPoolTokensToDepositBasedOnWeth` is useful as a standalone **view** for frontends and integrators, but calling it from `deposit` duplicates work already partially done in the caller.
+
+**Impact:**
+
+No security impact or incorrect accounting — deposits still compute the right `poolTokensToDeposit` and `liquidityTokensToMint`. The impact is **gas inefficiency on a core user path**:
+
+- Up to **two redundant external calls** per `deposit` (one entirely dead, one duplicate `wethReserves` read).
+- ERC-20 `balanceOf` is a cross-contract `CALL`; cost depends on the token implementation but is non-trivial on every add-liquidity transaction.
+- Users pay more gas than necessary for a frequently used operation.
+
+**Proof of Concept:**
+
+1. Inspect `deposit` — `poolTokenReserves` on line 135 is not referenced after assignment except in comments.
+2. Trace `getPoolTokensToDepositBasedOnWeth` — it re-fetches both token balances.
+3. Count external `balanceOf` calls in the `totalLiquidityTokenSupply() > 0` branch: **4** (`weth` ×2, `poolToken` ×2).
+4. The minimum required for both formulas is **2** (one read per reserve, shared across `poolTokensToDeposit` and `liquidityTokensToMint`).
+
+**Recommended Mitigation:**
+
+Read each reserve once in `deposit` and inline both calculations. Keep `getPoolTokensToDepositBasedOnWeth` for external callers only:
+
+```diff
+if (totalLiquidityTokenSupply() > 0) {
+    uint256 wethReserves = i_wethToken.balanceOf(address(this));
+    uint256 poolTokenReserves = i_poolToken.balanceOf(address(this));
+
+-   uint256 poolTokensToDeposit = getPoolTokensToDepositBasedOnWeth(wethToDeposit);
++   uint256 poolTokensToDeposit =
++       (wethToDeposit * poolTokenReserves) / wethReserves;
+
+    // ... slippage checks unchanged ...
+
+    liquidityTokensToMint =
+        (wethToDeposit * totalLiquidityTokenSupply()) / wethReserves;
+}
+```
+
+Alternatively, add an internal overload that accepts pre-fetched reserves:
+
+```solidity
+function _poolTokensToDeposit(
+    uint256 wethToDeposit,
+    uint256 wethReserves,
+    uint256 poolTokenReserves
+) private pure returns (uint256) {
+    return (wethToDeposit * poolTokenReserves) / wethReserves;
+}
+```
+
+and have the public `getPoolTokensToDepositBasedOnWeth` delegate to it after reading balances.
+
+## Likelihood & Impact:
+**IMPACT:** None — minor extra gas cost per deposit; no fund loss or logic error.
+**LIKELIHOOD:** High — affects every non-initial `deposit` by design.
+**Severity:** Informational 

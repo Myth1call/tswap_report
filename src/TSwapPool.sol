@@ -60,7 +60,7 @@ contract TSwapPool is ERC20 {
         uint256 wethWithdrawn,
         uint256 poolTokensWithdrawn
     );
-    // @audit-info: 3 parameters should be indexed if more than 3 parameters
+    // @written: 3 parameters should be indexed if more than 3 parameters
     event Swap(
         address indexed swapper,
         IERC20 tokenIn,
